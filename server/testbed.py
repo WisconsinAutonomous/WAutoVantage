@@ -2,22 +2,35 @@
 import math, time, random, ctypes, os
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
-
+from PIL import Image
 import pyglet
 from pyglet.window import key, mouse
 from pyglet import gl
 from pyglet.graphics.shader import Shader, ShaderProgram
+import fast_capture
 
-# GStreamer RTSP support for NVIDIA Jetson/GPUs
-_GST_AVAILABLE = False
-try:
-    import gi
-    gi.require_version('Gst', '1.0')
-    gi.require_version('GstRtspServer', '1.0')
-    from gi.repository import Gst, GstRtspServer, GLib
-    Gst.init(None)
-except Exception:
-    _GST_AVAILABLE = False
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+
+Gst.init(None)
+
+# In AVHMI.__init__():
+stream_width = 2560
+stream_height = 1440
+
+pipeline = Gst.parse_launch(
+    f'appsrc name=src is-live=true block=true format=time '
+    f'caps=video/x-raw,format=RGB,width={stream_width},height={stream_height},framerate=30/1 '
+    '! videoconvert '
+    '! x264enc tune=zerolatency bitrate=2000 speed-preset=ultrafast key-int-max=30 '
+    '! video/x-h264,profile=baseline '  # Add explicit profile
+    '! rtph264pay config-interval=1 pt=96 '
+    '! udpsink host=127.0.0.1 port=5000 sync=false'  # sync=false helps
+)
+
+appsrc = pipeline.get_by_name('src')
+pipeline.set_state(Gst.State.PLAYING)
 
 # ------------------------------------------------------------
 # Minimal MTL parser (grabs first map_Kd path)
@@ -656,101 +669,6 @@ def create_texture_2d(path: str) -> Optional[pyglet.image.Texture]:
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
-class RTSPStreamer:
-    def __init__(self, width: int, height: int, fps: int = 30, port: int = 8554, mount: str = "/sim"):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.port = port
-        self.mount = mount
-        self._loop = None
-        self._server = None
-        self._factory = None
-        self._appsrc = None
-        self._pts_ns = 0
-        self.is_active = False
-
-    def _choose_encoder(self):
-        if not _GST_AVAILABLE:
-            return None
-        try:
-            if Gst.ElementFactory.find("nvv4l2h264enc"):
-                return "nvv4l2h264enc insert-sps-pps=true maxperf-enable=true bitrate=4000000"
-            if Gst.ElementFactory.find("nvh264enc"):
-                return "nvh264enc bitrate=4000"
-        except Exception:
-            pass
-        return "x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000"
-
-    def start(self):
-        if not _GST_AVAILABLE:
-            print("RTSP disabled: GStreamer not available on this system")
-            return False
-        enc = self._choose_encoder()
-        if enc is None:
-            print("RTSP disabled: no H.264 encoder available")
-            return False
-        launch = (
-            f"appsrc name=mysrc is-live=true format=GST_FORMAT_TIME caps=video/x-raw,format=RGB,width={self.width},height={self.height},framerate={self.fps}/1 "
-            f"! videoconvert ! {enc} ! rtph264pay name=pay0 pt=96"
-        )
-        try:
-            self._server = GstRtspServer.RTSPServer()
-            self._server.props.service = str(self.port)
-            self._factory = GstRtspServer.RTSPMediaFactory()
-            self._factory.set_launch(launch)
-            self._factory.set_latency(100)
-            self._factory.set_shared(True)
-
-            def on_configure(factory, media):
-                try:
-                    pipeline = media.get_element()
-                    self._appsrc = pipeline.get_by_name("mysrc")
-                    if self._appsrc:
-                        self._appsrc.set_property("stream-type", 0)
-                        self._appsrc.set_property("format", Gst.Format.TIME)
-                        self._appsrc.set_property("is-live", True)
-                        self._appsrc.set_property("do-timestamp", True)
-                except Exception as e:
-                    print(f"RTSP media-configure error: {e}")
-
-            self._factory.connect("media-configure", on_configure)
-            mounts = self._server.get_mount_points()
-            mounts.add_factory(self.mount, self._factory)
-            self._server.attach(None)
-            self._loop = GLib.MainLoop()
-            import threading
-            threading.Thread(target=self._loop.run, daemon=True).start()
-            self.is_active = True
-            print(f"RTSP streaming at rtsp://localhost:{self.port}{self.mount}")
-            return True
-        except Exception as e:
-            print(f"Failed to start RTSP server: {e}")
-            return False
-
-    def stop(self):
-        self.is_active = False
-        try:
-            if self._loop is not None:
-                self._loop.quit()
-        except Exception:
-            pass
-
-    def push_rgb_frame(self, data: bytes):
-        if not (self.is_active and _GST_AVAILABLE and self._appsrc is not None):
-            return
-        try:
-            buf = Gst.Buffer.new_allocate(None, len(data), None)
-            buf.fill(0, data)
-            dur = int(1e9 / max(1, self.fps))
-            buf.pts = self._pts_ns
-            buf.dts = self._pts_ns
-            buf.duration = dur
-            self._pts_ns += dur
-            self._appsrc.emit("push-buffer", buf)
-        except Exception as e:
-            print(f"RTSP push error: {e}")
-
 class AVHMI(pyglet.window.Window):
     def __init__(self, width=1280, height=720, fps=60):
         cfg = gl.Config(double_buffer=True, depth_size=24, major_version=3, minor_version=3)
@@ -1011,13 +929,6 @@ class AVHMI(pyglet.window.Window):
         self.last_time = time.perf_counter()
         pyglet.clock.schedule_interval(self.update, 1.0/self.fps)
 
-        # Start RTSP streaming if available
-        try:
-            self.streamer = RTSPStreamer(self.width, self.height, self.fps, port=8554, mount="/sim")
-            self.streamer.start()
-        except Exception as e:
-            print(f"RTSP init failed: {e}")
-
     def _stream_grid(self):
         ix = int(math.floor(self.ego.pos[0] / self.tile_size))
         iz = int(math.floor(self.ego.pos[2] / self.tile_size))
@@ -1159,16 +1070,15 @@ class AVHMI(pyglet.window.Window):
         self.hud.text = f"Speed {self.ego.v:4.1f} m/s   Yaw {math.degrees(self.ego.yaw):5.1f} deg"
         self.hud.draw()
 
-        # Capture and stream current frame via RTSP
-        try:
-            if getattr(self, 'streamer', None) and self.streamer.is_active:
-                img = pyglet.image.get_buffer_manager().get_color_buffer().get_image_data()
-                data = img.get_data('RGB', self.width * 3)
-                self.streamer.push_rgb_frame(data)
-        except Exception as e:
-            pass
+
+        data = fast_capture.read_framebuffer(stream_width, stream_height)
+
+        buf = Gst.Buffer.new_allocate(None, len(data), None)
+        buf.fill(0, data)
+        appsrc.emit('push-buffer', buf)
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
     window = AVHMI(1280, 720, 60)
+    pyglet.options['shadow_window'] = True
     pyglet.app.run()

@@ -163,3 +163,27 @@ The application's server is available both as a python scripts and docker image.
     ```bash
     python server/unit_tests.py
     ```
+
+
+### RTSP updates
+- To run testbed.py
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install pyglet
+    pip install pillow
+    cd server
+    python setup.py build_ext --inplace
+    cd ..
+    pip install pycairo PyGObject
+    ```
+
+    ON SERVER SIDE:
+    ```bash
+    python server/testbed.py
+    ```
+
+    ON CLIENT SIDE:
+    ```bash
+    gst-launch-1.0 -v udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96" ! rtph264depay ! avdec_h264 ! videoconvert ! autovideosink
+    ```
